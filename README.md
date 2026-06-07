@@ -8,7 +8,8 @@ Codex QQ Bridge is the main bridge runtime for forwarding Codex desktop events t
 
 - `codex-qq-bridge.js`: page-side bridge injected into Codex.
 - `codex_qq_bridge_cdp_relay.py`: CDP relay that injects the bridge and relays events/commands to AstrBot.
-- `.github/workflows/build.yml`: GitHub Actions workflow that builds a single-file Windows executable.
+- `main.ico`: Windows executable icon used by release builds.
+- `.github/workflows/build.yml`: GitHub Actions workflow that builds multi-platform single-file release artifacts.
 
 The AstrBot plugin is intentionally kept in a separate repository:
 
@@ -36,13 +37,13 @@ python .\codex_qq_bridge_cdp_relay.py
 
 ## Build Single File
 
-GitHub Actions builds `codex-qq-bridge-cdp-relay.exe` with PyInstaller and embeds `codex-qq-bridge.js` into the onefile bundle.
+GitHub Actions builds multi-platform onefile artifacts with PyInstaller and embeds `codex-qq-bridge.js` into each bundle. Windows builds also use `main.ico` as the executable icon.
 
 To build locally:
 
 ```powershell
 pip install pyinstaller -r requirements.txt
-pyinstaller --onefile --name codex-qq-bridge-cdp-relay --add-data "codex-qq-bridge.js;." codex_qq_bridge_cdp_relay.py
+pyinstaller --onefile --name codex-qq-bridge-cdp-relay --icon main.ico --add-data "codex-qq-bridge.js;." codex_qq_bridge_cdp_relay.py
 ```
 
 The executable will be generated under `dist/`.

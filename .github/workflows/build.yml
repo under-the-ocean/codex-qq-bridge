@@ -8,11 +8,70 @@ on:
       - "v*"
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to create or update"
+        required: false
+        default: "nightly"
+      prerelease:
+        description: "Mark manual release as prerelease"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
 
 jobs:
-  windows-onefile:
-    name: Windows onefile relay
-    runs-on: windows-latest
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64
+            runner: windows-latest
+            asset_name: codex-qq-bridge-cdp-relay-windows-x64.exe
+            pyinstaller_name: codex-qq-bridge-cdp-relay
+            output_path: dist/codex-qq-bridge-cdp-relay.exe
+            add_data_sep: ";"
+            use_icon: true
+          - target: windows-arm64
+            runner: windows-11-arm
+            asset_name: codex-qq-bridge-cdp-relay-windows-arm64.exe
+            pyinstaller_name: codex-qq-bridge-cdp-relay
+            output_path: dist/codex-qq-bridge-cdp-relay.exe
+            add_data_sep: ";"
+            use_icon: true
+          - target: linux-x64
+            runner: ubuntu-latest
+            asset_name: codex-qq-bridge-cdp-relay-linux-x64
+            pyinstaller_name: codex-qq-bridge-cdp-relay
+            output_path: dist/codex-qq-bridge-cdp-relay
+            add_data_sep: ":"
+            use_icon: false
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            asset_name: codex-qq-bridge-cdp-relay-linux-arm64
+            pyinstaller_name: codex-qq-bridge-cdp-relay
+            output_path: dist/codex-qq-bridge-cdp-relay
+            add_data_sep: ":"
+            use_icon: false
+          - target: macos-x64
+            runner: macos-13
+            asset_name: codex-qq-bridge-cdp-relay-macos-x64
+            pyinstaller_name: codex-qq-bridge-cdp-relay
+            output_path: dist/codex-qq-bridge-cdp-relay
+            add_data_sep: ":"
+            use_icon: false
+          - target: macos-arm64
+            runner: macos-latest
+            asset_name: codex-qq-bridge-cdp-relay-macos-arm64
+            pyinstaller_name: codex-qq-bridge-cdp-relay
+            output_path: dist/codex-qq-bridge-cdp-relay
+            add_data_sep: ":"
+            use_icon: false
 
     steps:
       - name: Checkout
@@ -29,11 +88,50 @@ jobs:
           pip install pyinstaller -r requirements.txt
 
       - name: Build onefile executable
+        shell: pwsh
         run: |
-          pyinstaller --onefile --name codex-qq-bridge-cdp-relay --add-data "codex-qq-bridge.js;." codex_qq_bridge_cdp_relay.py
+          $args = @(
+            "--onefile",
+            "--name", "${{ matrix.pyinstaller_name }}",
+            "--add-data", "codex-qq-bridge.js${{ matrix.add_data_sep }}."
+          )
+          if ("${{ matrix.use_icon }}" -eq "true") {
+            $args += @("--icon", "main.ico")
+          }
+          $args += "codex_qq_bridge_cdp_relay.py"
+          pyinstaller @args
+
+      - name: Prepare release asset
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item -LiteralPath "${{ matrix.output_path }}" -Destination "release/${{ matrix.asset_name }}" -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: codex-qq-bridge-cdp-relay-windows
-          path: dist/codex-qq-bridge-cdp-relay.exe
+          name: ${{ matrix.asset_name }}
+          path: release/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+          generate_release_notes: true
+          files: release-assets/*
