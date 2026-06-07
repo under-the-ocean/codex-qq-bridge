@@ -811,15 +811,17 @@
     const rows = sidebarThreadRows();
     const items = rows.map(conversationItemFromRow);
     const matchIndex = items.findIndex((item) => matchesConversation(item, target));
+    const activeItem = items.find((item) => item.active);
     pushDebug("conversation-switch-attempt", {
       target,
-      items: items.map((item) => ({
-        index: item.index,
-        id: item.id,
-        name: item.name,
-        displayName: item.displayName,
-        active: item.active,
-      })),
+      itemCount: items.length,
+      active: activeItem
+        ? {
+            index: activeItem.index,
+            id: activeItem.id,
+            displayName: activeItem.displayName,
+          }
+        : null,
     });
     if (matchIndex < 0) {
       throw new Error(`Conversation not found: ${target}`);
