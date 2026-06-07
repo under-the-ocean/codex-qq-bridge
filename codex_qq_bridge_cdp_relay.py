@@ -47,6 +47,7 @@ class CdpRelay:
         self.astrbot_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=500)
         self.astrbot_disconnect_event = asyncio.Event()
         self.sent_signatures: dict[str, float] = {}
+        self.logged_signatures: dict[str, float] = {}
         self.state: dict[str, Any] = {
             "id": SCRIPT_ID,
             "version": SCRIPT_VERSION,
@@ -88,6 +89,7 @@ class CdpRelay:
     def message_signature(self, message: dict[str, Any]) -> str:
         event = message.get("event") or {}
         detail = event.get("detail") or {}
+        debug = message.get("debug") or {}
         stable = {
             "type": message.get("type"),
             "event": event.get("event"),
@@ -97,6 +99,8 @@ class CdpRelay:
             "previousStatus": detail.get("previousStatus"),
             "commandId": message.get("commandId"),
             "reason": message.get("reason"),
+            "debugType": debug.get("type"),
+            "debugDetail": debug.get("detail"),
         }
         raw = json.dumps(stable, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -113,6 +117,46 @@ class CdpRelay:
             return False
         self.sent_signatures[signature] = now
         return True
+
+    def should_log_message(self, message: dict[str, Any]) -> bool:
+        now = asyncio.get_running_loop().time()
+        cutoff = now - DEDUP_SECONDS
+        self.logged_signatures = {key: ts for key, ts in self.logged_signatures.items() if ts >= cutoff}
+        signature = self.message_signature(message)
+        if signature in self.logged_signatures:
+            return False
+        self.logged_signatures[signature] = now
+        return True
+
+    def log_page_debug(self, message: dict[str, Any]) -> None:
+        if not self.should_log_message(message):
+            return
+        debug = message.get("debug") or {}
+        debug_type = str(debug.get("type") or "-")
+        detail = debug.get("detail")
+        try:
+            detail_text = json.dumps(detail, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            detail_text = str(detail)
+        if len(detail_text) > 1200:
+            detail_text = detail_text[:1200] + "...(truncated)"
+        self.log("page-debug", debug_type, detail_text)
+
+    def log_bridge_message(self, message: dict[str, Any], source: str) -> None:
+        message_type = str(message.get("type") or "-")
+        if message_type == "debug":
+            self.log_page_debug(message)
+            return
+        if not self.should_log_message(message):
+            return
+        event = message.get("event") or {}
+        event_name = str(event.get("event") or "-")
+        detail = event.get("detail") or {}
+        conversation_id = str(event.get("conversationId") or detail.get("conversationId") or "")
+        preview = str(detail.get("text") or detail.get("status") or detail.get("reason") or "")
+        if len(preview) > 200:
+            preview = preview[:200] + "...(truncated)"
+        self.log("page-message", source, f"type={message_type}", f"event={event_name}", f"conversation={conversation_id}", f"preview={preview}")
 
     def find_codex_target(self) -> dict[str, Any]:
         targets = self.fetch_json(f"{CDP_HTTP}/json/list")
@@ -176,6 +220,9 @@ class CdpRelay:
         try:
             message = json.loads(raw_payload)
             self.state["last_binding_at"] = self.now_text()
+            if message.get("type") == "debug":
+                self.log_page_debug(message)
+                return
             await self.send_astrbot(message)
         except ConnectionClosed as exc:
             self.mark_astrbot_disconnected(f"AstrBot websocket closed: {exc}")
@@ -207,11 +254,23 @@ class CdpRelay:
             await self.cdp_send("Runtime.addBinding", {"name": CDP_EVENT_BINDING})
         except Exception as exc:
             self.log("binding setup warning", str(exc))
+        binding_type_before = await self.cdp_eval(f"typeof window[{json.dumps(CDP_EVENT_BINDING)}]")
         source = BRIDGE_SCRIPT.read_text(encoding="utf-8")
         expression = f"(0, eval)({json.dumps(source, ensure_ascii=False)})"
         await self.cdp_eval(expression)
         current = await self.cdp_eval("window.__codexQqBridgeVersion || ''")
-        self.log(f"bridge injected {previous or '-'} -> {current or '-'}")
+        binding_type_after = await self.cdp_eval(f"typeof window[{json.dumps(CDP_EVENT_BINDING)}]")
+        self.log(
+            f"bridge injected {previous or '-'} -> {current or '-'}",
+            json.dumps(
+                {
+                    "binding_before": binding_type_before,
+                    "binding_after": binding_type_after,
+                    "script": str(BRIDGE_SCRIPT),
+                },
+                ensure_ascii=False,
+            ),
+        )
 
     async def connect_astrbot(self) -> None:
         self.astrbot_ws = await websockets.connect(ASTRBOT_WS, ping_interval=20, open_timeout=5)
@@ -295,7 +354,11 @@ class CdpRelay:
             })()"""
         )
         for item in items or []:
-            await self.send_astrbot(item.get("message") or item)
+            message = item.get("message") or item
+            self.log_bridge_message(message, "poll")
+            if message.get("type") == "debug":
+                continue
+            await self.send_astrbot(message)
 
     async def push_page_message(self, message: dict[str, Any]) -> None:
         await self.cdp_eval(

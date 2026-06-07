@@ -2,7 +2,7 @@
   "use strict";
 
   const SCRIPT_ID = "codex-qq-bridge";
-  const SCRIPT_VERSION = "0.2.17";
+  const SCRIPT_VERSION = "0.2.18";
   const API_NAME = "__codexQqBridge";
   const DEBUG_NAME = "__codexQqBridgeDebug";
   const CDP_EVENT_BINDING = "__codexQqBridgeCdpEvent";
@@ -23,6 +23,23 @@
   const BRIDGE_HEARTBEAT_MS = 5000;
   const CONVERSATION_SWITCH_TIMEOUT_MS = 4000;
   const CONVERSATION_SWITCH_SETTLE_MS = 300;
+  const RELAY_DEBUG_TYPES = new Set([
+    "conversation-target-enter",
+    "conversation-switch-attempt",
+    "conversation-switch-match",
+    "conversation-switch-wait",
+    "conversation-ensure-active",
+    "conversation-return-failed",
+    "sidebar-capture-start",
+    "sidebar-capture-read",
+    "sidebar-capture-approval",
+    "sidebar-capture-complete",
+    "sidebar-capture-failed",
+    "stop-command-start",
+    "stop-command-clicked",
+    "injector-relay-message-error",
+    "cdp-binding-error",
+  ]);
 
   if (window.__codexQqBridgeScriptInstalled && window.__codexQqBridgeVersion === SCRIPT_VERSION) return;
   window.__codexQqBridgeScriptInstalled = true;
@@ -179,20 +196,15 @@
     if (state.debug.length > DEBUG_LIMIT) state.debug.splice(0, state.debug.length - DEBUG_LIMIT);
     window[DEBUG_NAME] = state.debug.slice();
     if (window[API_NAME]) window[API_NAME].debug = state.debug.slice();
-    queueInjectorOutbox({
+    if (!RELAY_DEBUG_TYPES.has(String(type))) return;
+    const message = {
       type: "debug",
       client: {
         sessionId: state.remoteBridge.sessionId,
       },
       debug: entry,
-    });
-    sendCdpBindingMessage({
-      type: "debug",
-      client: {
-        sessionId: state.remoteBridge.sessionId,
-      },
-      debug: entry,
-    });
+    };
+    if (!sendCdpBindingMessage(message)) queueInjectorOutbox(message);
   }
 
   function normalizeConversationId(value) {
@@ -1527,7 +1539,14 @@
       projectId: currentProjectId(),
       detail,
     };
-    pushDebug("event", payload);
+    if (event === "assistant-message") {
+      pushDebug("assistant-message", {
+        reason: detail.reason || "",
+        textLength: String(detail.text || "").length,
+      });
+    } else {
+      pushDebug("event", payload);
+    }
     const handlers = state.listeners.get(event);
     if (handlers) {
       [...handlers].forEach((handler) => {
@@ -1542,7 +1561,7 @@
       });
     }
     window.dispatchEvent(new CustomEvent("codex-qq-bridge", { detail: payload }));
-    sendRemoteEvent(payload);
+    if (event !== "assistant-message") sendRemoteEvent(payload);
     return payload;
   }
 
@@ -2109,8 +2128,9 @@
       },
       event: eventPayload,
     };
-    const cdpOk = sendCdpBindingMessage(message);
-    return sendBridgeMessage(message) || cdpOk;
+    if (sendRemoteMessage(message)) return true;
+    if (sendCdpBindingMessage(message)) return true;
+    return sendInjectorRelayMessage(message);
   }
 
   function sendCdpBindingMessage(message) {
