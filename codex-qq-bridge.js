@@ -2,7 +2,7 @@
   "use strict";
 
   const SCRIPT_ID = "codex-qq-bridge";
-  const SCRIPT_VERSION = "0.2.18";
+  const SCRIPT_VERSION = "0.2.19";
   const API_NAME = "__codexQqBridge";
   const DEBUG_NAME = "__codexQqBridgeDebug";
   const CDP_EVENT_BINDING = "__codexQqBridgeCdpEvent";
@@ -14,7 +14,9 @@
   const RELAY_INBOUND_EVENT = "codex-qq-bridge-inbound";
   const RELAY_OUTBOUND_EVENT = "codex-qq-bridge-outbound";
   const ROUTE_SYNC_DELAY_MS = 80;
-  const COMPOSER_ACTION_POLL_MS = 100;
+  const SYNC_THROTTLE_MS = 200;
+  const FAST_POLL_MS = 200;
+  const COMPOSER_ACTION_POLL_MS = 200;
   const SIDEBAR_STATUS_POLL_MS = 1000;
   const TASK_COMPLETE_STABLE_MS = 1200;
   const SEND_VERIFY_TIMEOUT_MS = 2500;
@@ -27,7 +29,6 @@
     "conversation-target-enter",
     "conversation-switch-attempt",
     "conversation-switch-match",
-    "conversation-switch-wait",
     "conversation-ensure-active",
     "conversation-return-failed",
     "sidebar-capture-start",
@@ -126,6 +127,11 @@
       active: false,
       previousConversationId: "",
       previousConversationName: "",
+    },
+    sync: {
+      timer: 0,
+      pendingReason: "",
+      lastAt: 0,
     },
   };
 
@@ -655,7 +661,7 @@
     if (fingerprint === state.composerAction.fingerprint) return false;
     state.composerAction.fingerprint = fingerprint;
     state.composerAction.lastChangedAt = new Date().toISOString();
-    syncState(reason);
+    scheduleSyncState(reason);
     return true;
   }
 
@@ -867,7 +873,7 @@
         syncState("conversation-active");
         return active || { id: currentConversationId(), name: currentConversationName() };
       }
-      await sleep(100);
+      await sleep(FAST_POLL_MS);
     }
     throw new Error(`Conversation did not become active: ${target}`);
   }
@@ -1011,7 +1017,7 @@
     while (now() - startedAt < timeoutMs) {
       const button = approvalSubmitButton(surface);
       if (button && !isDisabledControl(button)) return button;
-      await sleep(50);
+      await sleep(FAST_POLL_MS);
     }
     return approvalSubmitButton(surface);
   }
@@ -1027,7 +1033,7 @@
     focusElement(textarea);
     clickElement(textarea);
     setNativeValue(textarea, nextText);
-    await sleep(100);
+    await sleep(FAST_POLL_MS);
     const submitButton = await waitForEnabledApprovalSubmit(surface);
     if (!submitButton) throw new Error("Approval submit button not found");
     if (!clickElement(submitButton)) throw new Error("Failed to submit approval feedback");
@@ -1056,7 +1062,7 @@
       if (status === "running" || status === "review_required") {
         return { ok: true, verifiedBy: "status", draft, status };
       }
-      await sleep(100);
+      await sleep(FAST_POLL_MS);
     }
     return {
       ok: false,
@@ -1078,7 +1084,7 @@
     }
     setComposerText(nextText);
     if (!submit) return { ok: true, submitted: false, text: nextText };
-    await sleep(50);
+    await sleep(FAST_POLL_MS);
     const beforeSubmitDraft = getComposerText();
     const submission = submitComposer();
     const verify = await waitForMessageSent(beforeSubmitDraft, Number(options.verifyTimeoutMs) || SEND_VERIFY_TIMEOUT_MS);
@@ -1110,7 +1116,7 @@
       const yesButton = findApprovalSurfaceControl(surface, LABELS.reviewButton);
       if (!yesButton) throw new Error("Approval option not found");
       if (!clickElement(yesButton)) throw new Error("Failed to select approval option");
-      await sleep(100);
+      await sleep(FAST_POLL_MS);
       const submitButton = await waitForEnabledApprovalSubmit(surface);
       if (!submitButton) throw new Error("Approval submit button not found");
       if (!clickElement(submitButton)) throw new Error("Failed to submit approval");
@@ -1162,7 +1168,7 @@
     if (!clickElement(button)) {
       throw new Error("Failed to click stop button");
     }
-    await sleep(100);
+    await sleep(FAST_POLL_MS);
     syncState("remote-stop");
     pushDebug("stop-command-clicked", {
       conversationId: currentConversationId(),
@@ -1700,13 +1706,13 @@
     if (joined && LABELS.runningText.test(joined)) {
       setStatus("running", source, { url });
     }
-    window.setTimeout(() => syncState(source), 0);
+    scheduleSyncState(source);
   }
 
   function inspectPayloadText(text, source, url) {
     const raw = String(text || "");
     if (!raw) {
-      window.setTimeout(() => syncState(source), 0);
+      scheduleSyncState(source);
       return;
     }
     let parsedAny = false;
@@ -1755,10 +1761,11 @@
       requestId,
       pendingRequests: state.network.pending,
     });
-    window.setTimeout(() => syncState(`${source}-finish`), 0);
+    scheduleSyncState(`${source}-finish`);
   }
 
   function syncState(reason = "manual") {
+    state.sync.lastAt = now();
     updateRouteState();
 
     const assistant = readAssistantSnapshot();
@@ -1784,11 +1791,24 @@
     syncSidebarConversationStatuses(reason);
   }
 
+  function scheduleSyncState(reason = "scheduled", delayMs = SYNC_THROTTLE_MS) {
+    state.sync.pendingReason = reason;
+    if (state.sync.timer) return;
+    const elapsed = now() - (state.sync.lastAt || 0);
+    const waitMs = Math.max(delayMs - elapsed, 0);
+    state.sync.timer = window.setTimeout(() => {
+      const nextReason = state.sync.pendingReason || reason;
+      state.sync.timer = 0;
+      state.sync.pendingReason = "";
+      syncState(nextReason);
+    }, waitMs);
+  }
+
   function installDomObserver() {
     if (!window.MutationObserver || window.__codexQqBridgeDomObserverVersion === SCRIPT_VERSION) return;
     window.__codexQqBridgeDomObserver?.disconnect?.();
     const observer = new MutationObserver(() => {
-      if (!syncComposerActionChange("composer-action-dom")) syncState("dom");
+      if (!syncComposerActionChange("composer-action-dom")) scheduleSyncState("dom");
     });
     const start = () => {
       const root = document.body || document.documentElement || document.querySelector("main");
@@ -1844,7 +1864,7 @@
     const routeHistory = window.history;
     const originals = window.__codexQqBridgeRouteOriginals || {};
     window.__codexQqBridgeRouteOriginals = originals;
-    const sync = () => window.setTimeout(() => syncState("route"), ROUTE_SYNC_DELAY_MS);
+    const sync = () => scheduleSyncState("route", Math.max(ROUTE_SYNC_DELAY_MS, SYNC_THROTTLE_MS));
     ["pushState", "replaceState"].forEach((method) => {
       const original = originals[method] || routeHistory?.[method];
       originals[method] = original;
@@ -1909,7 +1929,7 @@
             .clone()
             .text()
             .then((text) => inspectPayloadText(text, "fetch", url))
-            .catch(() => window.setTimeout(() => syncState("fetch"), 0))
+            .catch(() => scheduleSyncState("fetch"))
             .finally(() => markRequestFinished("fetch", url, requestId));
         } else {
           markRequestFinished("fetch", url, requestId);
@@ -1947,7 +1967,7 @@
             try {
               inspectPayloadText(this.responseText || "", "xhr", url);
             } catch (_) {
-              window.setTimeout(() => syncState("xhr"), 0);
+              scheduleSyncState("xhr");
             }
           }
         } finally {
@@ -1978,10 +1998,10 @@
             event.data
               .text()
               .then((text) => inspectPayloadText(text, "websocket", url))
-              .catch(() => window.setTimeout(() => syncState("websocket"), 0));
+              .catch(() => scheduleSyncState("websocket"));
           }
         } catch (_) {
-          window.setTimeout(() => syncState("websocket"), 0);
+          scheduleSyncState("websocket");
         }
       });
       return socket;
