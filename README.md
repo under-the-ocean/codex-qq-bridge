@@ -8,8 +8,6 @@ Codex QQ Bridge is the main bridge runtime for forwarding Codex desktop events t
 
 - `codex-qq-bridge.js`: page-side bridge injected into Codex.
 - `codex_qq_bridge_cdp_relay.py`: CDP relay that injects the bridge and relays events/commands to AstrBot.
-- `codex-qq-bridge-injector-relay.js`: browser/injector relay helper for environments where direct page WebSocket is blocked by CSP.
-- `start-codex-qq-bridge-cdp-relay-py.ps1`: Windows launcher for the Python relay.
 - `.github/workflows/build.yml`: GitHub Actions workflow that builds a single-file Windows executable.
 
 The AstrBot plugin is intentionally kept in a separate repository:
@@ -34,12 +32,6 @@ $env:CODEX_ASTRBOT_WS = "ws://192.168.10.11:32124/ws/codex"
 ```powershell
 pip install -r requirements.txt
 python .\codex_qq_bridge_cdp_relay.py
-```
-
-Or use the launcher:
-
-```powershell
-.\start-codex-qq-bridge-cdp-relay-py.ps1
 ```
 
 ## Build Single File
