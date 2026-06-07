@@ -1,0 +1,39 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-onefile:
+    name: Windows onefile relay
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller -r requirements.txt
+
+      - name: Build onefile executable
+        run: |
+          pyinstaller --onefile --name codex-qq-bridge-cdp-relay --add-data "codex-qq-bridge.js;." codex_qq_bridge_cdp_relay.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-qq-bridge-cdp-relay-windows
+          path: dist/codex-qq-bridge-cdp-relay.exe
