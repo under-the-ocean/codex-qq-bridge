@@ -2,7 +2,7 @@
   "use strict";
 
   const SCRIPT_ID = "codex-qq-bridge";
-  const SCRIPT_VERSION = "0.2.13";
+  const SCRIPT_VERSION = "0.2.17";
   const API_NAME = "__codexQqBridge";
   const DEBUG_NAME = "__codexQqBridgeDebug";
   const CDP_EVENT_BINDING = "__codexQqBridgeCdpEvent";
@@ -21,6 +21,8 @@
   const DEBUG_LIMIT = 200;
   const MESSAGE_LIMIT = 100;
   const BRIDGE_HEARTBEAT_MS = 5000;
+  const CONVERSATION_SWITCH_TIMEOUT_MS = 4000;
+  const CONVERSATION_SWITCH_SETTLE_MS = 300;
 
   if (window.__codexQqBridgeScriptInstalled && window.__codexQqBridgeVersion === SCRIPT_VERSION) return;
   window.__codexQqBridgeScriptInstalled = true;
@@ -103,7 +105,14 @@
       outbox: [],
       outboxSeq: 0,
     },
+    capture: {
+      active: false,
+      previousConversationId: "",
+      previousConversationName: "",
+    },
   };
+
+  const pendingConversationCaptures = new Set();
 
   function now() {
     return Date.now();
@@ -161,14 +170,29 @@
   }
 
   function pushDebug(type, detail) {
-    state.debug.push({
+    const entry = {
       at: new Date().toISOString(),
       type,
       detail,
-    });
+    };
+    state.debug.push(entry);
     if (state.debug.length > DEBUG_LIMIT) state.debug.splice(0, state.debug.length - DEBUG_LIMIT);
     window[DEBUG_NAME] = state.debug.slice();
     if (window[API_NAME]) window[API_NAME].debug = state.debug.slice();
+    queueInjectorOutbox({
+      type: "debug",
+      client: {
+        sessionId: state.remoteBridge.sessionId,
+      },
+      debug: entry,
+    });
+    sendCdpBindingMessage({
+      type: "debug",
+      client: {
+        sessionId: state.remoteBridge.sessionId,
+      },
+      debug: entry,
+    });
   }
 
   function normalizeConversationId(value) {
@@ -755,20 +779,51 @@
     if (!text) return false;
     if (String(item.index) === text) return true;
     if (normalizeText(item.id).toLowerCase() === text) return true;
-    const name = normalizeText(item.name).toLowerCase();
-    return name === text || name.includes(text);
+    const candidates = [
+      item.name,
+      item.displayName,
+      item.title,
+      item.folderName,
+      item.folderName && item.name ? `${item.folderName} / ${item.name}` : "",
+    ]
+      .map((value) => normalizeText(value).toLowerCase())
+      .filter(Boolean);
+    return candidates.some((value) => value === text || value.includes(text) || text.includes(value));
+  }
+
+  function conversationClickableTarget(row) {
+    return row;
   }
 
   function switchConversation(target) {
     const rows = sidebarThreadRows();
     const items = rows.map(conversationItemFromRow);
     const matchIndex = items.findIndex((item) => matchesConversation(item, target));
+    pushDebug("conversation-switch-attempt", {
+      target,
+      items: items.map((item) => ({
+        index: item.index,
+        id: item.id,
+        name: item.name,
+        displayName: item.displayName,
+        active: item.active,
+      })),
+    });
     if (matchIndex < 0) {
       throw new Error(`Conversation not found: ${target}`);
     }
     const row = rows[matchIndex];
     const item = items[matchIndex];
-    if (!clickElement(row)) {
+    const clickTarget = conversationClickableTarget(row);
+    pushDebug("conversation-switch-match", {
+      target,
+      matchIndex,
+      item,
+      clickableTag: clickTarget?.tagName || "",
+      clickableRole: clickTarget?.getAttribute?.("role") || "",
+      rowTag: row?.tagName || "",
+    });
+    if (!clickElement(clickTarget) && !clickElement(row)) {
       throw new Error(`Failed to switch conversation: ${item.name || item.id}`);
     }
     window.setTimeout(() => syncState("conversation-switch"), ROUTE_SYNC_DELAY_MS);
@@ -778,6 +833,139 @@
       index: item.index,
     });
     return { ok: true, item };
+  }
+
+  async function waitForConversationActive(target, timeoutMs = CONVERSATION_SWITCH_TIMEOUT_MS) {
+    const startedAt = now();
+    const wanted = normalizeText(target).toLowerCase();
+    while (now() - startedAt < timeoutMs) {
+      updateRouteState();
+      const active = activeSidebarConversation();
+      const activeId = normalizeText(active?.id || currentConversationId()).toLowerCase();
+      const activeName = normalizeText(active?.displayName || active?.name || currentConversationName()).toLowerCase();
+      pushDebug("conversation-switch-wait", {
+        target,
+        activeId,
+        activeName,
+      });
+      if (wanted && (activeId === wanted || activeName === wanted || (active && matchesConversation(active, wanted)))) {
+        await sleep(CONVERSATION_SWITCH_SETTLE_MS);
+        syncState("conversation-active");
+        return active || { id: currentConversationId(), name: currentConversationName() };
+      }
+      await sleep(100);
+    }
+    throw new Error(`Conversation did not become active: ${target}`);
+  }
+
+  async function ensureConversationActive(target) {
+    const normalizedTarget = normalizeText(target);
+    pushDebug("conversation-ensure-start", {
+      target,
+      normalizedTarget,
+      currentConversationId: currentConversationId(),
+      currentConversationName: currentConversationName(),
+    });
+    if (!normalizedTarget) {
+      return {
+        switched: false,
+        previousConversationId: currentConversationId(),
+        previousConversationName: currentConversationName(),
+        activeConversationId: currentConversationId(),
+        activeConversationName: currentConversationName(),
+      };
+    }
+    const items = getConversations();
+    const current = items.find((item) => item.active) || activeSidebarConversation();
+    const currentId = current?.id || currentConversationId();
+    const currentName = current?.displayName || current?.name || currentConversationName();
+    const targetItem = items.find((item) => matchesConversation(item, normalizedTarget));
+    const targetId = targetItem?.id || normalizedTarget;
+    const targetName = targetItem?.displayName || targetItem?.name || normalizedTarget;
+    pushDebug("conversation-ensure-resolved", {
+      target,
+      normalizedTarget,
+      currentId,
+      currentName,
+      targetId,
+      targetName,
+      targetItem,
+    });
+    if (
+      (currentId && normalizeText(currentId).toLowerCase() === normalizeText(targetId).toLowerCase()) ||
+      (currentName && normalizeText(currentName).toLowerCase() === normalizeText(targetName).toLowerCase())
+    ) {
+      pushDebug("conversation-ensure-skip", {
+        target,
+        currentId,
+        currentName,
+        targetId,
+        targetName,
+      });
+      return {
+        switched: false,
+        previousConversationId: currentId,
+        previousConversationName: currentName,
+        activeConversationId: currentId,
+        activeConversationName: currentName,
+      };
+    }
+    switchConversation(normalizedTarget);
+    const active = await waitForConversationActive(targetId || targetName);
+    pushDebug("conversation-ensure-active", {
+      target,
+      switched: true,
+      previousConversationId: currentId,
+      previousConversationName: currentName,
+      activeConversationId: active?.id || currentConversationId(),
+      activeConversationName: active?.displayName || active?.name || currentConversationName(),
+    });
+    return {
+      switched: true,
+      previousConversationId: currentId,
+      previousConversationName: currentName,
+      activeConversationId: active?.id || currentConversationId(),
+      activeConversationName: active?.displayName || active?.name || currentConversationName(),
+    };
+  }
+
+  async function withConversationTarget(target, fn) {
+    pushDebug("conversation-target-enter", {
+      target,
+      beforeConversationId: currentConversationId(),
+      beforeConversationName: currentConversationName(),
+    });
+    const context = await ensureConversationActive(target);
+    try {
+      pushDebug("conversation-target-ready", {
+        target,
+        context,
+      });
+      return await fn(context);
+    } finally {
+      if (context.switched && (context.previousConversationId || context.previousConversationName)) {
+        const returnTarget = context.previousConversationId || context.previousConversationName;
+        try {
+          pushDebug("conversation-target-return-start", {
+            target,
+            returnTarget,
+          });
+          switchConversation(returnTarget);
+          await waitForConversationActive(returnTarget);
+          pushDebug("conversation-target-returned", {
+            target,
+            returnTarget,
+            currentConversationId: currentConversationId(),
+            currentConversationName: currentConversationName(),
+          });
+        } catch (error) {
+          pushDebug("conversation-return-failed", {
+            target: returnTarget,
+            message: error?.message || String(error),
+          });
+        }
+      }
+    }
   }
 
   function submitComposer() {
@@ -868,6 +1056,9 @@
   async function sendMessage(text, options = {}) {
     const submit = options.submit !== false;
     const nextText = String(text ?? "");
+    if (options.target) {
+      return withConversationTarget(options.target, () => sendMessage(nextText, { ...options, target: "" }));
+    }
     if (submit && findApprovalSurface()) {
       return submitApprovalFeedback(nextText);
     }
@@ -896,7 +1087,10 @@
     };
   }
 
-  async function approveReview() {
+  async function approveReview(options = {}) {
+    if (options.target) {
+      return withConversationTarget(options.target, () => approveReview({ ...options, target: "" }));
+    }
     const surface = findApprovalSurface();
     if (surface) {
       const yesButton = findApprovalSurfaceControl(surface, LABELS.reviewButton);
@@ -932,6 +1126,42 @@
     return {
       ok: true,
       label: elementLabel(button),
+    };
+  }
+
+  async function stopCurrentRun(options = {}) {
+    if (options.target) {
+      return withConversationTarget(options.target, () => stopCurrentRun({ ...options, target: "" }));
+    }
+    const actionState = getComposerActionState();
+    pushDebug("stop-command-start", {
+      conversationId: currentConversationId(),
+      conversationName: currentConversationName(),
+      running: actionState.running,
+      stopButton: actionState.stopButton,
+    });
+    const button = findStopButton();
+    if (!button) {
+      throw new Error("Stop button not found");
+    }
+    const label = elementLabel(button);
+    if (!clickElement(button)) {
+      throw new Error("Failed to click stop button");
+    }
+    await sleep(100);
+    syncState("remote-stop");
+    pushDebug("stop-command-clicked", {
+      conversationId: currentConversationId(),
+      conversationName: currentConversationName(),
+      label,
+    });
+    emit("stop-requested", {
+      source: "remote-command",
+      label,
+    });
+    return {
+      ok: true,
+      label,
     };
   }
 
@@ -1120,7 +1350,7 @@
 
   function shouldSuppressActiveTaskCompletion() {
     const active = activeSidebarConversation();
-    return active?.status === "review_required" || active?.status === "task_complete_unread";
+    return active?.status === "review_required";
   }
 
   function isCurrentConversationItem(item) {
@@ -1134,6 +1364,98 @@
 
   function shouldSuppressSidebarReview(item) {
     return item?.status === "review_required" && isCurrentConversationItem(item) && !!findApprovalSurface();
+  }
+
+  function shouldSuppressSidebarTaskComplete(item) {
+    return item?.status === "task_complete_unread" && isCurrentConversationItem(item);
+  }
+
+  async function captureConversationEventFromSidebar(item, reason = "sidebar-capture") {
+    const key = `${item?.id || item?.name}:${item?.status}:${reason}`;
+    if (!item?.id || pendingConversationCaptures.has(key)) return false;
+    pendingConversationCaptures.add(key);
+    pushDebug("sidebar-capture-start", {
+      key,
+      reason,
+      item,
+      currentConversationId: currentConversationId(),
+      currentConversationName: currentConversationName(),
+    });
+    try {
+      await withConversationTarget(item.id || item.name, async () => {
+        state.capture.active = true;
+        state.capture.previousConversationId = currentConversationId();
+        state.capture.previousConversationName = currentConversationName();
+        await sleep(CONVERSATION_SWITCH_SETTLE_MS);
+        syncState(`${reason}:after-switch`);
+        const assistant = readAssistantSnapshot();
+        const text = cleanPushText(assistant.text || state.lastAssistantText);
+        pushDebug("sidebar-capture-read", {
+          key,
+          reason,
+          conversationId: currentConversationId(),
+          conversationName: currentConversationName(),
+          assistantTextLength: (assistant.text || "").length,
+          cachedTextLength: (state.lastAssistantText || "").length,
+          finalTextLength: text.length,
+          status: item.status,
+        });
+        if (item.status === "review_required") {
+          const approval = readApprovalSnapshot();
+          pushDebug("sidebar-capture-approval", {
+            key,
+            reason,
+            explanationLength: String(approval?.explanation || "").length,
+            commandLength: String(approval?.command || "").length,
+            textLength: String(approval?.text || text || "").length,
+          });
+          emit("review-required", {
+            reason: `${reason}:captured`,
+            source: "captured",
+            conversationId: currentConversationId(),
+            conversationName: currentConversationName(),
+            text: approval.text || text,
+            approval,
+            active: false,
+            viaAutoSwitch: true,
+          });
+        } else if (item.status === "task_complete_unread" && text) {
+          pushDebug("sidebar-capture-complete", {
+            key,
+            reason,
+            textPreview: text.slice(0, 200),
+            textLength: text.length,
+          });
+          emit("task-complete", {
+            reason: `${reason}:captured`,
+            source: "captured",
+            conversationId: currentConversationId(),
+            conversationName: currentConversationName(),
+            text,
+            active: false,
+            viaAutoSwitch: true,
+          });
+        }
+      });
+      pushDebug("sidebar-capture-finished", {
+        key,
+        reason,
+      });
+      return true;
+    } catch (error) {
+      pushDebug("sidebar-capture-failed", {
+        reason,
+        conversationId: item?.id,
+        conversationName: item?.displayName || item?.name,
+        message: error?.message || String(error),
+      });
+      return false;
+    } finally {
+      state.capture.active = false;
+      state.capture.previousConversationId = "";
+      state.capture.previousConversationName = "";
+      pendingConversationCaptures.delete(key);
+    }
   }
 
   function setStatus(nextStatus, reason = "manual", extra = {}) {
@@ -1163,7 +1485,7 @@
       });
     }
 
-    if (previousStatus === "running" && nextStatus === "idle" && state.lastAssistantText) {
+    if (previousStatus === "running" && nextStatus === "idle") {
       if (shouldSuppressActiveTaskCompletion()) return true;
       scheduleTaskCompletion(reason, extra);
     }
@@ -1243,6 +1565,24 @@
         });
         return;
       }
+      if (shouldSuppressSidebarTaskComplete(item)) {
+        pushDebug("sidebar-task-complete-suppressed", {
+          reason,
+          conversationId: item.id,
+          conversationName: item.displayName || item.name,
+          active: !!item.active,
+        });
+        scheduleTaskCompletion(`${reason}:sidebar-current`, {
+          conversationId: item.id,
+          conversationName: item.displayName || item.name,
+          source: "sidebar-current",
+          sidebarStatus: item.status,
+          sidebarStatusLabel: item.statusLabel,
+          sidebarStatusReason: item.statusReason || "",
+          active: !!item.active,
+        });
+        return;
+      }
 
       const detail = {
         reason,
@@ -1256,9 +1596,17 @@
         active: !!item.active,
       };
       if (item.status === "review_required") {
-        emit("review-required", detail);
+        if (detail.active) {
+          emit("review-required", detail);
+        } else {
+          captureConversationEventFromSidebar(item, `${reason}:review`);
+        }
       } else if (item.status === "task_complete_unread") {
-        emit("task-complete", detail);
+        if (detail.active) {
+          emit("task-complete", detail);
+        } else {
+          captureConversationEventFromSidebar(item, `${reason}:complete`);
+        }
       }
     });
   }
@@ -1664,10 +2012,11 @@
   async function executeRemoteCommand(command) {
     const type = String(command?.type || "");
     const payload = command?.payload || {};
-    if (type === "send") return sendMessage(payload.text ?? "", { submit: payload.submit !== false });
+    if (type === "send") return sendMessage(payload.text ?? "", { submit: payload.submit !== false, target: payload.target ?? "" });
     if (type === "draft") return setComposerText(payload.text ?? "");
     if (type === "submit") return submitComposer();
-    if (type === "approve") return approveReview();
+    if (type === "approve") return approveReview({ target: payload.target ?? "" });
+    if (type === "stop") return stopCurrentRun({ target: payload.target ?? "" });
     if (type === "switch-conversation") return switchConversation(payload.target ?? payload.name ?? payload.id ?? payload.index ?? "");
     if (type === "list-conversations") return { ok: true, items: getConversations() };
     if (type === "sync") {
@@ -2048,6 +2397,10 @@
       return jsonResponse({ ok: true, result: submitComposer() });
     }
 
+    if (method === "POST" && path === "/stop") {
+      return jsonResponse({ ok: true, result: stopCurrentRun({ target: body?.target ?? "" }) });
+    }
+
     if (method === "POST" && path === "/conversation") {
       return jsonResponse({ ok: true, result: switchConversation(body?.target ?? body?.name ?? body?.id ?? body?.index ?? "") });
     }
@@ -2096,6 +2449,7 @@
     submit: () => submitComposer(),
     sendMessage: (text, options) => sendMessage(text, options),
     approveReview,
+    stopCurrentRun,
     pullBridgeMessages,
     pushBridgeMessage,
     connectRemoteBridge: () => {
