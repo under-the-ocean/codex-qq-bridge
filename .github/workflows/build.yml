@@ -59,7 +59,7 @@ jobs:
             add_data_sep: ":"
             use_icon: false
           - target: macos-x64
-            runner: macos-13
+            runner: macos-15-intel
             asset_name: codex-qq-bridge-cdp-relay-macos-x64
             pyinstaller_name: codex-qq-bridge-cdp-relay
             output_path: dist/codex-qq-bridge-cdp-relay
