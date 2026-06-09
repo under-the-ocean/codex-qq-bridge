@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -28,13 +29,146 @@ ROOT = Path(__file__).resolve().parent
 PACKAGED_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
 DEFAULT_BRIDGE_SCRIPT = PACKAGED_ROOT / "codex-qq-bridge.js"
 BRIDGE_SCRIPT = Path(os.environ.get("CODEX_BRIDGE_SCRIPT", DEFAULT_BRIDGE_SCRIPT))
-CDP_HTTP = os.environ.get("CODEX_CDP_HTTP", "http://127.0.0.1:9229").rstrip("/")
+CODEX_PLUS_SESSION_DIR = Path(os.environ.get("CODEX_PLUS_SESSION_DIR", r"C:\Users\Administrator\.codex-session-delete"))
+CODEX_PLUS_LOG = Path(os.environ.get("CODEX_PLUS_LOG", CODEX_PLUS_SESSION_DIR / "codex-plus.log"))
+CODEX_PLUS_STATUS = Path(os.environ.get("CODEX_PLUS_STATUS", CODEX_PLUS_SESSION_DIR / "latest-status.json"))
+DEFAULT_CDP_HTTP = "http://127.0.0.1:9229"
 ASTRBOT_WS = os.environ.get("CODEX_ASTRBOT_WS", "ws://192.168.10.11:32124/ws/codex")
 POLL_SECONDS = float(os.environ.get("CODEX_RELAY_POLL_SECONDS", "0.5"))
 HEARTBEAT_SECONDS = float(os.environ.get("CODEX_RELAY_HEARTBEAT_SECONDS", "5"))
 RECONNECT_SECONDS = float(os.environ.get("CODEX_RELAY_RECONNECT_SECONDS", "2"))
 LOG_FILE = Path(os.environ.get("CODEX_RELAY_LOG", ROOT / "codex-qq-bridge-cdp-relay.log"))
 DEDUP_SECONDS = float(os.environ.get("CODEX_RELAY_DEDUP_SECONDS", "120"))
+
+
+def valid_port(value: Any) -> int | None:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return None
+    if 1 <= port <= 65535:
+        return port
+    return None
+
+
+def append_port(candidates: list[tuple[int, str]], seen: set[int], value: Any, source: str) -> None:
+    port = valid_port(value)
+    if port is None or port in seen:
+        return
+    seen.add(port)
+    candidates.append((port, source))
+
+
+def tail_text(path: Path, max_bytes: int = 2 * 1024 * 1024) -> str:
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(0, size - max_bytes))
+        return handle.read().decode("utf-8", errors="replace")
+
+
+def iter_json_debug_ports(value: Any) -> list[Any]:
+    ports: list[Any] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).replace("-", "_").lower()
+            if normalized == "debug_port":
+                ports.append(item)
+            else:
+                ports.extend(iter_json_debug_ports(item))
+    elif isinstance(value, list):
+        for item in value:
+            ports.extend(iter_json_debug_ports(item))
+    return ports
+
+
+def codex_plus_log_ports() -> list[tuple[int, str]]:
+    if not CODEX_PLUS_LOG.exists():
+        return []
+
+    candidates: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    patterns = [
+        re.compile(r'"debug_port"\s*:\s*(\d{1,5})', re.IGNORECASE),
+        re.compile(r'"debugPort"\s*:\s*(\d{1,5})', re.IGNORECASE),
+        re.compile(r"--remote-debugging-port=(\d{1,5})", re.IGNORECASE),
+        re.compile(r"\bremote-debugging-port\b\D{0,12}(\d{1,5})", re.IGNORECASE),
+        re.compile(r"\bDebug(?:ger)?(?:\s+port)?\s*[:=\s]\s*(\d{1,5})", re.IGNORECASE),
+        re.compile(r"\bDevTools\b.*?\b(?:127\.0\.0\.1|localhost):(\d{1,5})", re.IGNORECASE),
+    ]
+
+    try:
+        lines = tail_text(CODEX_PLUS_LOG).splitlines()
+    except OSError:
+        return []
+
+    for line in reversed(lines):
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            data = None
+        if data is not None:
+            for port in iter_json_debug_ports(data):
+                append_port(candidates, seen, port, "codex-plus.log")
+        for pattern in patterns:
+            for match in pattern.finditer(line):
+                append_port(candidates, seen, match.group(1), "codex-plus.log")
+    return candidates
+
+
+def codex_plus_status_ports() -> list[tuple[int, str]]:
+    if not CODEX_PLUS_STATUS.exists():
+        return []
+    try:
+        data = json.loads(CODEX_PLUS_STATUS.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    candidates: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for port in iter_json_debug_ports(data):
+        append_port(candidates, seen, port, "latest-status.json")
+    return candidates
+
+
+def is_codex_cdp_http(base_url: str) -> bool:
+    try:
+        with urlopen(f"{base_url.rstrip('/')}/json/list", timeout=1.5) as response:
+            targets = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return False
+
+    if not isinstance(targets, list):
+        return False
+    return any(
+        item.get("type") == "page"
+        and (
+            item.get("url") == "app://-/index.html"
+            or "Codex" in str(item.get("title", ""))
+            or item.get("webSocketDebuggerUrl")
+        )
+        for item in targets
+        if isinstance(item, dict)
+    )
+
+
+def resolve_cdp_http() -> tuple[str, str]:
+    env_value = os.environ.get("CODEX_CDP_HTTP")
+    if env_value:
+        return env_value.rstrip("/"), "CODEX_CDP_HTTP"
+
+    candidates = codex_plus_status_ports() + codex_plus_log_ports()
+    for port, source in candidates:
+        base_url = f"http://127.0.0.1:{port}"
+        if is_codex_cdp_http(base_url):
+            return base_url, source
+    if candidates:
+        port, source = candidates[0]
+        return f"http://127.0.0.1:{port}", source
+    return DEFAULT_CDP_HTTP, "default"
+
+
+CDP_HTTP, CDP_HTTP_SOURCE = resolve_cdp_http()
 
 
 class CdpRelay:
@@ -53,6 +187,7 @@ class CdpRelay:
             "version": SCRIPT_VERSION,
             "started_at": self.now_text(),
             "cdp_http": CDP_HTTP,
+            "cdp_http_source": CDP_HTTP_SOURCE,
             "astrbot_ws": ASTRBOT_WS,
             "cdp_online": False,
             "astrbot_online": False,
@@ -453,6 +588,7 @@ class CdpRelay:
             json.dumps(
                 {
                     "cdp_http": CDP_HTTP,
+                    "cdp_http_source": CDP_HTTP_SOURCE,
                     "astrbot_ws": ASTRBOT_WS,
                     "bridge_script": str(BRIDGE_SCRIPT),
                 },
